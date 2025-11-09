@@ -1,0 +1,2 @@
+# TheScoutAPI
+FastAPI + psycopg backend
