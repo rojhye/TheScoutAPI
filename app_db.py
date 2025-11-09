@@ -4,84 +4,64 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv, dotenv_values
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
 import psycopg
 
-
-# ──────────────────────────────────────────────────────────────
-# 환경변수(.env) 로드 — 경로 고정 + BOM/대소문자/공백 방어
-# ──────────────────────────────────────────────────────────────
+# ── .env 로드(경로 고정 + 방어) ─────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent
 DOTENV_PATH = PROJECT_ROOT / ".env"
-
-# 1) 표준 로드(UTF-8)
 load_dotenv(dotenv_path=DOTENV_PATH, override=True, encoding="utf-8")
-
-# 2) 실패 대비: 파일 직접 파싱
-raw_map = dotenv_values(DOTENV_PATH) if DOTENV_PATH.exists() else {}
+_raw_map = dotenv_values(DOTENV_PATH) if DOTENV_PATH.exists() else {}
 
 
 def _norm_key(k: str) -> str:
-    # BOM 제거, 앞뒤 공백 제거, 소문자로 통일
     return k.replace("\ufeff", "").strip().lower()
 
 
 def _norm_val(v: str | None) -> str | None:
-    if v is None:
-        return None
-    return v.strip().strip('"').strip("'")
+    return None if v is None else v.strip().strip('"').strip("'")
 
 
-# 프로세스 환경 + 파일 값 모두 정규화해 병합
-env_map = {_norm_key(k): _norm_val(v) for k, v in os.environ.items() if isinstance(k, str)}
-file_map = {_norm_key(k): _norm_val(v) for k, v in raw_map.items() if isinstance(k, str)}
+_env = {_norm_key(k): _norm_val(v) for k, v in os.environ.items() if isinstance(k, str)}
+_file = {_norm_key(k): _norm_val(v) for k, v in _raw_map.items() if isinstance(k, str)}
 
 
 def get_cfg(name: str, default: str | None = None) -> str | None:
     k = _norm_key(name)
-    return env_map.get(k) or file_map.get(k) or default
+    return _env.get(k) or _file.get(k) or default
 
 
 raw_db_url = get_cfg("SUPABASE_DB_URL")
 if not raw_db_url:
     raise RuntimeError(f"SUPABASE_DB_URL not found. Checked env and {DOTENV_PATH}")
 
-# 드라이버/쿼리 제거하여 DSN 정규화
-# 예: postgresql+asyncpg://...?... → postgresql://... (쿼리 제거)
-_parts = urlsplit(raw_db_url)
-BASE_DSN = urlunsplit(("postgresql", _parts.netloc, _parts.path, "", ""))
+parts = urlsplit(raw_db_url)
+BASE_DSN = urlunsplit(("postgresql", parts.netloc, parts.path, "", ""))
 
-# 선택적 앱 설정 (없으면 기본값 사용)
-APP_HOST = get_cfg("APP_HOST", "127.0.0.1")
-APP_PORT = int(get_cfg("APP_PORT", "8000"))
-APP_RELOAD = get_cfg("APP_RELOAD", "true").lower() == "true"
+# 선택 설정(현재 미사용 → 언더스코어로 Lint 회피)
+_APP_HOST = get_cfg("APP_HOST", "127.0.0.1")
+_APP_PORT = int(get_cfg("APP_PORT", "8000"))
+_APP_RELOAD = get_cfg("APP_RELOAD", "true").lower() == "true"
 
-
-# ──────────────────────────────────────────────────────────────
-# FastAPI 본체 + CORS
-# ──────────────────────────────────────────────────────────────
+# ── FastAPI ────────────────────────────────────────────────────────────────
 app = FastAPI(title="TheScout API v1")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 필요 시 특정 도메인으로 제한
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ──────────────────────────────────────────────────────────────
-# DB 연결 의존성(요청마다 짧게 연결). 추후 풀/ORM로 리팩터 권장.
-# ──────────────────────────────────────────────────────────────
+# ── DB 연결 의존성 ─────────────────────────────────────────────────────────
 def get_conn():
     with psycopg.connect(BASE_DSN, sslmode="require") as conn:
         yield conn
 
 
-# ──────────────────────────────────────────────────────────────
-# 라우트
-# ──────────────────────────────────────────────────────────────
+# ── 기본 라우트 ────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
@@ -89,6 +69,7 @@ def root():
         "health": "/health",
         "version": "/version",
         "db_now": "/db/now",
+        "candidates": "/candidates",
     }
 
 
@@ -112,14 +93,11 @@ def db_now(conn=Depends(get_conn)):
         return {"db_now": ts.isoformat()}
 
 
-from fastapi import HTTPException
-from pydantic import BaseModel, EmailStr
-from typing import Optional
-
-
+# ── Candidates CRUD ────────────────────────────────────────────────────────
 class CandidateIn(BaseModel):
     name: str
-    email: Optional[EmailStr] = None
+    # Optional 대신 | None 문법 권장. Optional 쓰고 있으면 위 typing import 유지.
+    email: EmailStr | None = None
 
 
 @app.get("/candidates")
@@ -171,7 +149,6 @@ def get_candidate(cid: str, conn=Depends(get_conn)):
 def delete_candidate(cid: str, conn=Depends(get_conn)):
     with conn.cursor() as cur:
         cur.execute("delete from candidates where id = %s", (cid,))
-        # rowcount가 0이면 없던 것
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Not found")
         return
