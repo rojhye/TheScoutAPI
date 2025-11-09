@@ -1,0 +1,364 @@
+"""
+FastAPI + Supabase Postgres (async SQLAlchemy) — v1
+- Replaces in‑memory DB with Postgres on Supabase
+- Keeps same API surface as v0
+- Loads env from .env (SUPABASE_DB_URL)
+
+Run:
+  pip install fastapi uvicorn pydantic "sqlalchemy[asyncio]" asyncpg python-dotenv
+  uvicorn app_db:app --host 127.0.0.1 --port 8000
+
+.env example:
+  SUPABASE_DB_URL=postgresql+asyncpg://postgres:<PASSWORD>@db.<project>.supabase.co:5432/postgres
+
+Supabase SQL (run in SQL Editor):
+--------------------------------------------------
+create extension if not exists "uuid-ossp";
+
+create table if not exists users (
+  id uuid primary key default uuid_generate_v4(),
+  email text unique,
+  created_at timestamptz default now()
+);
+
+create table if not exists roles (
+  id text primary key,
+  project_id text,
+  title text not null,
+  level text,
+  location text,
+  jd_raw text not null,
+  rti_json jsonb not null,
+  share_token text,
+  created_at timestamptz default now()
+);
+
+create table if not exists candidates (
+  id text primary key,
+  created_at timestamptz default now()
+);
+
+create table if not exists candidate_submissions (
+  id text primary key,
+  role_id text references roles(id) on delete cascade,
+  candidate_id text references candidates(id) on delete cascade,
+  resume_url text,
+  profile_json jsonb,
+  consent_bool boolean,
+  ts bigint
+);
+
+create table if not exists matches (
+  id text primary key,
+  role_id text references roles(id) on delete cascade,
+  candidate_id text references candidates(id) on delete cascade,
+  score_int int,
+  rationale_json jsonb,
+  flags_json jsonb
+);
+
+create index if not exists idx_submissions_role on candidate_submissions(role_id);
+create index if not exists idx_matches_role on matches(role_id, score_int desc);
+--------------------------------------------------
+"""
+from __future__ import annotations
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional
+from uuid import uuid4
+import time, os
+from dotenv import load_dotenv
+
+from sqlalchemy import text, Integer, String, JSON, Boolean
+from sqlalchemy.orm import declarative_base, Mapped, mapped_column
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy import select, insert
+
+load_dotenv()
+DB_URL = os.getenv("SUPABASE_DB_URL")
+if not DB_URL:
+    raise RuntimeError("SUPABASE_DB_URL not set. Put it in .env or environment.")
+
+engine = create_async_engine(DB_URL, echo=False, pool_pre_ping=True)
+Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+Base = declarative_base()
+
+# -----------------
+# ORM Models
+# -----------------
+class RoleORM(Base):
+    __tablename__ = "roles"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    project_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    title: Mapped[str] = mapped_column(String)
+    level: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    location: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    jd_raw: Mapped[str] = mapped_column(String)
+    rti_json: Mapped[dict] = mapped_column(JSON)
+    share_token: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+class CandidateORM(Base):
+    __tablename__ = "candidates"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+
+class SubmissionORM(Base):
+    __tablename__ = "candidate_submissions"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    role_id: Mapped[str] = mapped_column(String)
+    candidate_id: Mapped[str] = mapped_column(String)
+    resume_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    profile_json: Mapped[dict] = mapped_column(JSON)
+    consent_bool: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    ts: Mapped[int] = mapped_column(Integer)
+
+class MatchORM(Base):
+    __tablename__ = "matches"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    role_id: Mapped[str] = mapped_column(String)
+    candidate_id: Mapped[str] = mapped_column(String)
+    score_int: Mapped[int] = mapped_column(Integer)
+    rationale_json: Mapped[list] = mapped_column(JSON)
+    flags_json: Mapped[list] = mapped_column(JSON)
+
+# -----------------
+# Pydantic Schemas (same as v0)
+# -----------------
+class RTI(BaseModel):
+    must: List[str] = []
+    nice: List[str] = []
+    knockout: List[str] = []
+    weights: Dict[str, float] = Field(default_factory=lambda: {"must": 0.6, "nice": 0.3, "bonus": 0.1})
+    compensation: Dict[str, str] = Field(default_factory=dict)
+    screen_questions: List[str] = Field(default_factory=list)
+
+class RoleCreate(BaseModel):
+    project_id: Optional[str] = None
+    title: str
+    level: Optional[str] = None
+    location: Optional[str] = None
+    jd_raw: str
+
+class Role(BaseModel):
+    id: str
+    project_id: Optional[str] = None
+    title: str
+    level: Optional[str] = None
+    location: Optional[str] = None
+    jd_raw: str
+    rti_json: RTI
+    share_token: Optional[str] = None
+
+class RTIUpdate(BaseModel):
+    rti_json: RTI
+
+class CandidateProfile(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    skills: List[str] = []
+    years_exp: Optional[float] = None
+    latest_project: Optional[str] = None
+    visa_status: Optional[str] = None
+    notice_period: Optional[str] = None
+    location: Optional[str] = None
+    expected_comp: Optional[str] = None
+
+class CandidateIntake(BaseModel):
+    profile: CandidateProfile
+    resume_url: Optional[str] = None
+    consent_bool: bool = True
+
+class MatchResult(BaseModel):
+    candidate_id: str
+    score_int: int
+    rationale: List[str] = []
+    flags: List[str] = []
+
+# -----------------
+# App & helpers
+# -----------------
+app = FastAPI(title="TheScout API (v1 — Supabase)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def _id() -> str:
+    return uuid4().hex
+
+DEFAULT_RTI = RTI(
+    must=["3y+ backend", "Python", "Korean C1"],
+    nice=["FastAPI", "AWS", "ML ops"],
+    knockout=["No work authorization"],
+    weights={"must": 0.6, "nice": 0.3, "bonus": 0.1},
+    screen_questions=["Latest backend project?","Visa status?","Notice period?"],
+)
+
+def draft_rti(jd_raw: str) -> RTI:
+    t = jd_raw.lower()
+    must, nice = [], []
+    if "python" in t: must.append("Python")
+    if "backend" in t: must.append("3y+ backend")
+    for s in ["FastAPI","AWS","Postgres"]:
+        if s.lower() in t: nice.append(s)
+    return RTI(
+        must=list(dict.fromkeys(must or DEFAULT_RTI.must)),
+        nice=list(dict.fromkeys(nice or DEFAULT_RTI.nice)),
+        knockout=DEFAULT_RTI.knockout,
+        weights=DEFAULT_RTI.weights,
+        screen_questions=DEFAULT_RTI.screen_questions,
+    )
+
+def compute_score(rti: RTI, prof: CandidateProfile) -> MatchResult:
+    flags, rationale = [], []
+    skills = set(prof.skills or [])
+    rules_hits = 0
+    for m in rti.must:
+        if any(m.lower() in s.lower() for s in skills):
+            rules_hits += 1; rationale.append(f"+ {m} (must)")
+        else:
+            rationale.append(f"- {m} (missing)")
+    rules_score = rules_hits / max(1, len(rti.must))
+    nice_hits = sum(1 for n in rti.nice if any(n.lower() in s.lower() for s in skills))
+    nice_score = nice_hits / max(1, len(rti.nice))
+    score = int(round(100 * (0.7 * rules_score + 0.3 * nice_score)))
+    return MatchResult(candidate_id="", score_int=score, rationale=rationale, flags=flags)
+
+# -----------------
+# Endpoints
+# -----------------
+@app.on_event("startup")
+async def _startup():
+    # Ensure connection works
+    async with engine.begin() as conn:
+        await conn.execute(text("select 1"))
+
+@app.post("/roles", response_model=Role)
+async def create_role(payload: RoleCreate):
+    role_id = _id()
+    rti = draft_rti(payload.jd_raw)
+    async with Session() as s:
+        await s.execute(
+            insert(RoleORM).values(
+                id=role_id,
+                project_id=payload.project_id,
+                title=payload.title,
+                level=payload.level,
+                location=payload.location,
+                jd_raw=payload.jd_raw,
+                rti_json=rti.dict(),
+            )
+        )
+        await s.commit()
+        return Role(id=role_id, rti_json=rti, **payload.dict())
+
+@app.put("/roles/{role_id}/rti", response_model=Role)
+async def update_rti(role_id: str, payload: RTIUpdate):
+    async with Session() as s:
+        q = await s.execute(select(RoleORM).where(RoleORM.id == role_id))
+        row = q.scalar_one_or_none()
+        if not row:
+            raise HTTPException(404, "Role not found")
+        row.rti_json = payload.rti_json.dict()
+        await s.commit()
+        return Role(
+            id=row.id,
+            project_id=row.project_id,
+            title=row.title,
+            level=row.level,
+            location=row.location,
+            jd_raw=row.jd_raw,
+            rti_json=RTI(**row.rti_json),
+            share_token=row.share_token,
+        )
+
+@app.get("/roles/{role_id}/share", response_model=Dict[str,str])
+async def get_share(role_id: str):
+    async with Session() as s:
+        q = await s.execute(select(RoleORM).where(RoleORM.id == role_id))
+        row = q.scalar_one_or_none()
+        if not row:
+            raise HTTPException(404, "Role not found")
+        token = row.share_token or uuid4().hex[:12]
+        row.share_token = token
+        await s.commit()
+        return {"share_token": token}
+
+@app.post("/apply/{share_token}", response_model=Dict[str,str])
+async def apply_to_role(share_token: str, payload: CandidateIntake):
+    async with Session() as s:
+        q = await s.execute(select(RoleORM).where(RoleORM.share_token == share_token))
+        role = q.scalar_one_or_none()
+        if not role:
+            raise HTTPException(404, "Role token invalid")
+        cand_id, sub_id = _id(), _id()
+        await s.execute(text("insert into candidates(id) values(:id) on conflict (id) do nothing").bindparams(id=cand_id))
+        await s.execute(text(
+            """
+            insert into candidate_submissions(id, role_id, candidate_id, resume_url, profile_json, consent_bool, ts)
+            values(:id, :role_id, :candidate_id, :resume_url, :profile_json, :consent_bool, :ts)
+            """
+        ), {
+            "id": sub_id,
+            "role_id": role.id,
+            "candidate_id": cand_id,
+            "resume_url": payload.resume_url,
+            "profile_json": payload.profile.dict(),
+            "consent_bool": payload.consent_bool,
+            "ts": int(time.time()),
+        })
+        await s.commit()
+        return {"candidate_id": cand_id}
+
+@app.post("/match/{role_id}", response_model=Dict[str,int])
+async def match_role(role_id: str):
+    async with Session() as s:
+        q = await s.execute(select(RoleORM).where(RoleORM.id==role_id))
+        role = q.scalar_one_or_none()
+        if not role:
+            raise HTTPException(404, "Role not found")
+        rti = RTI(**role.rti_json)
+        subs = await s.execute(text("select * from candidate_submissions where role_id=:rid").bindparams(rid=role_id))
+        subs = [dict(r) for r in subs.mappings().all()]
+        count = 0
+        for r in subs:
+            prof = CandidateProfile(**r["profile_json"])
+            mr = compute_score(rti, prof)
+            mr_id = _id()
+            await s.execute(text(
+                """
+                insert into matches(id, role_id, candidate_id, score_int, rationale_json, flags_json)
+                values(:id, :role_id, :candidate_id, :score_int, :rationale_json, :flags_json)
+                on conflict (id) do nothing
+                """
+            ), {
+                "id": mr_id,
+                "role_id": role_id,
+                "candidate_id": r["candidate_id"],
+                "score_int": mr.score_int,
+                "rationale_json": mr.rationale,
+                "flags_json": mr.flags,
+            })
+            count += 1
+        await s.commit()
+        return {"scored": count}
+
+@app.get("/shortlist/{role_id}", response_model=List[MatchResult])
+async def shortlist(role_id: str, min_score: int = 0):
+    async with Session() as s:
+        rows = await s.execute(text(
+            "select candidate_id, score_int, rationale_json, flags_json from matches where role_id=:rid and score_int>=:min order by score_int desc"
+        ).bindparams(rid=role_id, min=min_score))
+        items = []
+        for m in rows.mappings():
+            items.append(MatchResult(candidate_id=m["candidate_id"], score_int=m["score_int"], rationale=m["rationale_json"], flags=m["flags_json"]))
+        return items
+
+@app.get("/health")
+async def health():
+    async with engine.begin() as conn:
+        await conn.execute(text("select 1"))
+    return {"ok": True}

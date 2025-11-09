@@ -1,0 +1,28 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Env/Secrets
+.env
+*.env
+
+# IDE/Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build/Reports
+dist/
+build/
+*.log
+
+# Uvicorn reload artifacts
+.reload/
