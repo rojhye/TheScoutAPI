@@ -5,6 +5,7 @@ FastAPI v0 skeleton for TheScout MVP
 - Env var: OPENAI_API_KEY (optional now)
 Run: uvicorn app:app --reload
 """
+
 from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,8 +35,10 @@ DB: Dict[str, Dict] = {
     "events": {},
 }
 
+
 def _id() -> str:
     return uuid4().hex
+
 
 # -----------------
 # Models
@@ -44,9 +47,12 @@ class RTI(BaseModel):
     must: List[str] = []
     nice: List[str] = []
     knockout: List[str] = []
-    weights: Dict[str, float] = Field(default_factory=lambda: {"must": 0.6, "nice": 0.3, "bonus": 0.1})
+    weights: Dict[str, float] = Field(
+        default_factory=lambda: {"must": 0.6, "nice": 0.3, "bonus": 0.1}
+    )
     compensation: Dict[str, str] = Field(default_factory=dict)
     screen_questions: List[str] = Field(default_factory=list)
+
 
 class RoleCreate(BaseModel):
     project_id: Optional[str] = None
@@ -55,13 +61,16 @@ class RoleCreate(BaseModel):
     location: Optional[str] = None
     jd_raw: str
 
+
 class Role(RoleCreate):
     id: str
     rti_json: RTI
     share_token: Optional[str] = None
 
+
 class RTIUpdate(BaseModel):
     rti_json: RTI
+
 
 class CandidateProfile(BaseModel):
     name: Optional[str] = None
@@ -74,16 +83,19 @@ class CandidateProfile(BaseModel):
     location: Optional[str] = None
     expected_comp: Optional[str] = None
 
+
 class CandidateIntake(BaseModel):
     profile: CandidateProfile
     resume_url: Optional[str] = None
     consent_bool: bool = True
+
 
 class MatchResult(BaseModel):
     candidate_id: str
     score_int: int
     rationale: List[str] = []
     flags: List[str] = []
+
 
 # -----------------
 # Utilities
@@ -123,7 +135,9 @@ def compute_score(rti: RTI, prof: CandidateProfile) -> MatchResult:
     # Knockouts
     flags = []
     if prof is None:
-        return MatchResult(candidate_id="", score_int=0, rationale=["No profile"], flags=["KO: empty profile"]) 
+        return MatchResult(
+            candidate_id="", score_int=0, rationale=["No profile"], flags=["KO: empty profile"]
+        )
     if not prof.email:
         flags.append("Missing email")
     # Simple rules engine
@@ -142,10 +156,11 @@ def compute_score(rti: RTI, prof: CandidateProfile) -> MatchResult:
     nice_hits = sum(1 for n in rti.nice if any(n.lower() in s.lower() for s in skills))
     nice_score = nice_hits / max(1, len(rti.nice))
     score = int(round(100 * (0.7 * rules_score + 0.3 * nice_score)))
-    if not prof.consent_bool if hasattr(prof, 'consent_bool') else False:
+    if not prof.consent_bool if hasattr(prof, "consent_bool") else False:
         flags.append("No consent")
         score = 0
     return MatchResult(candidate_id="", score_int=score, rationale=rationale, flags=flags)
+
 
 # -----------------
 # Endpoints
@@ -158,6 +173,7 @@ def create_role(payload: RoleCreate):
     DB["roles"][role_id] = role.dict()
     return role
 
+
 @app.put("/roles/{role_id}/rti", response_model=Role)
 def update_rti(role_id: str, payload: RTIUpdate):
     role = DB["roles"].get(role_id)
@@ -166,6 +182,7 @@ def update_rti(role_id: str, payload: RTIUpdate):
     role["rti_json"] = payload.rti_json.dict()
     DB["roles"][role_id] = role
     return Role(**role)
+
 
 @app.get("/roles/{role_id}/share", response_model=Dict[str, str])
 def get_share(role_id: str):
@@ -177,10 +194,13 @@ def get_share(role_id: str):
     DB["roles"][role_id] = role
     return {"share_token": token}
 
+
 @app.post("/apply/{share_token}", response_model=Dict[str, str])
 def apply_to_role(share_token: str, payload: CandidateIntake):
     # find role by token
-    role_id = next((rid for rid, r in DB["roles"].items() if r.get("share_token") == share_token), None)
+    role_id = next(
+        (rid for rid, r in DB["roles"].items() if r.get("share_token") == share_token), None
+    )
     if not role_id:
         raise HTTPException(404, "Role token invalid")
     cand_id = _id()
@@ -196,6 +216,7 @@ def apply_to_role(share_token: str, payload: CandidateIntake):
         "ts": int(time.time()),
     }
     return {"candidate_id": cand_id}
+
 
 @app.post("/match/{role_id}", response_model=Dict[str, int])
 def match_role(role_id: str):
@@ -216,11 +237,25 @@ def match_role(role_id: str):
         count += 1
     return {"scored": count}
 
+
 @app.get("/shortlist/{role_id}", response_model=List[MatchResult])
 def shortlist(role_id: str, min_score: int = 0):
-    rows = [m for m in DB["matches"].values() if m.get("role_id") == role_id and m.get("score_int", 0) >= min_score]
+    rows = [
+        m
+        for m in DB["matches"].values()
+        if m.get("role_id") == role_id and m.get("score_int", 0) >= min_score
+    ]
     rows.sort(key=lambda x: x.get("score_int", 0), reverse=True)
-    return [MatchResult(candidate_id=r["candidate_id"], score_int=r["score_int"], rationale=r.get("rationale", []), flags=r.get("flags", [])) for r in rows]
+    return [
+        MatchResult(
+            candidate_id=r["candidate_id"],
+            score_int=r["score_int"],
+            rationale=r.get("rationale", []),
+            flags=r.get("flags", []),
+        )
+        for r in rows
+    ]
+
 
 # Health
 @app.get("/health")
