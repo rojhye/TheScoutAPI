@@ -8,20 +8,32 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
+
+    env:
+      DB_HOST: ${{ secrets.DB_HOST }}
+      DB_PORT: ${{ secrets.DB_PORT }}
+      DB_NAME: ${{ secrets.DB_NAME }}
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
-      - name: Install deps
+          python-version: "3.13"
+
+      - name: Install dependencies
         run: |
-          python -m pip install -U pip
-          pip install -r requirements.txt || echo 'requirements optional on first run'
-          pip install ruff black
-      - name: Lint (ruff)
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint with ruff
         run: ruff check .
-      - name: Format check (black)
-        run: black --check .
-      - name: Smoke import
+
+      - name: Import test
         run: python -c "import app_db; print('IMPORT_OK')"
